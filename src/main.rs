@@ -7,7 +7,7 @@ use gl::types::GLfloat;
 use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::Window;
 
 use glutin::config::{Config, ConfigTemplateBuilder};
@@ -27,7 +27,7 @@ pub mod gl {
     pub use Gles2 as Gl;
 }
 
-pub fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = winit::event_loop::EventLoop::new().unwrap();
 
     let window_attributes = Window::default_attributes()
@@ -59,6 +59,20 @@ fn window_coords_to_ndc(x: f64, y: f64, width: u32, height: u32) -> [f32; 2] {
     let y = 1.0 - (2.0 * y as f32 / height as f32);
 
     [x, y]
+}
+
+fn distance(p1: [f32; 2], p2: [f32; 2]) -> f32 {
+    let dx = p1[0] - p2[0];
+    let dy = p1[1] - p2[1];
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn get_default_cursor(input_mode: InputMode) -> winit::window::CursorIcon {
+    match input_mode {
+        InputMode::Draw => winit::window::CursorIcon::Crosshair,
+        InputMode::Select => winit::window::CursorIcon::Default,
+        InputMode::Erase => winit::window::CursorIcon::Cell,
+    }
 }
 
 impl ApplicationHandler for App {
@@ -122,15 +136,14 @@ impl ApplicationHandler for App {
                     })
             });
 
-        #[cfg(android_platform)]
-        println!("Android window available");
-
         let window = window.take().unwrap_or_else(|| {
             let window_attributes = Window::default_attributes()
                 .with_transparent(true)
                 .with_title("Glutin triangle gradient example (press Escape to exit)");
             glutin_winit::finalize_window(event_loop, window_attributes, &gl_config).unwrap()
         });
+
+        window.set_cursor(get_default_cursor(InputMode::Draw));
 
         let attrs = window
             .build_surface_attributes(Default::default())
@@ -167,6 +180,9 @@ impl ApplicationHandler for App {
                 cursor_position: (0.0, 0.0),
                 strokes: Vec::new(),
                 current_stroke: None,
+                input_mode: InputMode::Draw,
+                clear_on_next_draw: false,
+                mouse_down: false,
             })
             .is_none());
     }
@@ -217,22 +233,91 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => event_loop.exit(),
+            // i'm positive there's a better way for this but i'm not familiar enough with rust
+            // syntax
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyD),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(AppState { window, .. }) = self.state.as_ref() {
+                    window.set_cursor(get_default_cursor(InputMode::Draw));
+                    if let Some(AppState { input_mode, .. }) = self.state.as_mut() {
+                        *input_mode = InputMode::Draw;
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyE),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(AppState { window, .. }) = self.state.as_ref() {
+                    window.set_cursor(get_default_cursor(InputMode::Erase));
+                    if let Some(AppState { input_mode, .. }) = self.state.as_mut() {
+                        *input_mode = InputMode::Erase;
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyS),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(AppState { window, .. }) = self.state.as_ref() {
+                    window.set_cursor(get_default_cursor(InputMode::Select));
+                    if let Some(AppState { input_mode, .. }) = self.state.as_mut() {
+                        *input_mode = InputMode::Select;
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let Some(AppState {
                     gl_context,
                     gl_surface,
                     window,
                     current_stroke,
+                    strokes,
+                    clear_on_next_draw,
                     ..
-                }) = self.state.as_ref()
+                }) = self.state.as_mut()
                 {
-                    if let Some(stroke) = current_stroke {
-                        let renderer = self.renderer.as_mut().unwrap();
-                        renderer.draw(stroke.clone());
-                        window.request_redraw();
+                    let mut latest = Vec::new();
+                    let strokes_to_render = if *clear_on_next_draw {
+                        strokes
+                    } else {
+                        if let Some(stroke) = current_stroke {
+                            latest.push(stroke.clone());
+                        } else if !strokes.is_empty() {
+                            latest.push(strokes.last().unwrap().clone());
+                        }
 
-                        gl_surface.swap_buffers(gl_context).unwrap();
+                        &mut latest
+                    };
+
+                    if strokes_to_render.is_empty() && !*clear_on_next_draw {
+                        return;
                     }
+
+                    let renderer = self.renderer.as_mut().unwrap();
+                    renderer.draw(strokes_to_render, *clear_on_next_draw);
+                    window.request_redraw();
+
+                    gl_surface.swap_buffers(gl_context).unwrap();
+
+                    *clear_on_next_draw = false;
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -240,6 +325,10 @@ impl ApplicationHandler for App {
                     cursor_position,
                     window,
                     current_stroke,
+                    strokes,
+                    input_mode,
+                    clear_on_next_draw,
+                    mouse_down,
                     ..
                 }) = self.state.as_mut()
                 {
@@ -250,6 +339,44 @@ impl ApplicationHandler for App {
                             .points
                             .push(window_coords_to_ndc(position.x, position.y, width, height));
                     }
+
+                    // current method of checking if the cursor is over a stroke
+                    // probably will need reworked
+                    let converted_cursor_position =
+                        window_coords_to_ndc(position.x, position.y, width, height);
+                    if input_mode == &InputMode::Select {
+                        for stroke in strokes.iter() {
+                            for point in stroke.points.iter() {
+                                if distance(*point, converted_cursor_position) < 0.02 {
+                                    window.set_cursor(winit::window::CursorIcon::Grab);
+                                    return;
+                                }
+                            }
+                        }
+                    } else if input_mode == &InputMode::Erase && *mouse_down && !*clear_on_next_draw
+                    {
+                        let mut index_to_remove = 0;
+                        for (i, stroke) in strokes.iter().enumerate() {
+                            for point in stroke.points.iter() {
+                                if distance(*point, converted_cursor_position) < 0.02 {
+                                    *clear_on_next_draw = true;
+                                    index_to_remove = i;
+                                    break;
+                                }
+                            }
+
+                            if *clear_on_next_draw {
+                                break;
+                            }
+                        }
+
+                        if *clear_on_next_draw {
+                            strokes.remove(index_to_remove);
+                        }
+                    }
+
+                    window.set_cursor(get_default_cursor(input_mode.clone()));
+                    window.request_redraw();
                 }
             }
             WindowEvent::MouseInput {
@@ -262,17 +389,45 @@ impl ApplicationHandler for App {
                     window,
                     cursor_position,
                     current_stroke,
+                    input_mode,
+                    strokes,
+                    clear_on_next_draw,
+                    mouse_down,
                     ..
                 }) = self.state.as_mut()
                 {
                     let (x, y) = cursor_position;
                     let (width, height): (u32, u32) = window.inner_size().into();
-                    let stroke = Stroke {
-                        points: vec![window_coords_to_ndc(*x, *y, width, height)],
-                        color: [1.0, 1.0, 1.0],
-                    };
+                    if input_mode == &InputMode::Draw {
+                        let stroke = Stroke {
+                            points: vec![window_coords_to_ndc(*x, *y, width, height)],
+                            color: [1.0, 1.0, 1.0],
+                        };
 
-                    *current_stroke = Some(stroke);
+                        *current_stroke = Some(stroke);
+                    } else if input_mode == &InputMode::Erase {
+                        let converted_cursor_position = window_coords_to_ndc(*x, *y, width, height);
+                        let mut index_to_remove = 0;
+                        for (i, stroke) in strokes.iter().enumerate() {
+                            for point in stroke.points.iter() {
+                                if distance(*point, converted_cursor_position) < 0.02 {
+                                    *clear_on_next_draw = true;
+                                    index_to_remove = i;
+                                    break;
+                                }
+                            }
+
+                            if *clear_on_next_draw {
+                                break;
+                            }
+                        }
+
+                        if *clear_on_next_draw {
+                            strokes.remove(index_to_remove);
+                        }
+                    }
+
+                    *mouse_down = true;
 
                     window.request_redraw();
                 }
@@ -286,6 +441,8 @@ impl ApplicationHandler for App {
                 if let Some(AppState {
                     current_stroke,
                     strokes,
+                    mouse_down,
+                    window,
                     ..
                 }) = self.state.as_mut()
                 {
@@ -293,28 +450,13 @@ impl ApplicationHandler for App {
                         strokes.push(stroke.clone());
                         *current_stroke = None;
                     }
+
+                    window.request_redraw();
+
+                    *mouse_down = false;
                 }
             }
             _ => (),
-        }
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        if let Some(AppState {
-            gl_context,
-            gl_surface,
-            window,
-            current_stroke,
-            ..
-        }) = self.state.as_ref()
-        {
-            if let Some(stroke) = current_stroke {
-                let renderer = self.renderer.as_mut().unwrap();
-                renderer.draw(stroke.clone());
-                window.request_redraw();
-
-                gl_surface.swap_buffers(gl_context).unwrap();
-            }
         }
     }
 }
@@ -343,9 +485,16 @@ impl App {
 }
 
 #[derive(Debug, Clone)]
-pub struct Stroke {
-    pub points: Vec<[f32; 2]>,
-    pub color: [f32; 3],
+struct Stroke {
+    points: Vec<[f32; 2]>,
+    color: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum InputMode {
+    Draw,
+    Select,
+    Erase,
 }
 
 struct AppState {
@@ -354,6 +503,9 @@ struct AppState {
     cursor_position: (f64, f64),
     strokes: Vec<Stroke>,
     current_stroke: Option<Stroke>,
+    input_mode: InputMode,
+    clear_on_next_draw: bool,
+    mouse_down: bool,
     // NOTE: Window should be dropped after all resources created using its
     // raw-window-handle.
     window: Window,
@@ -361,7 +513,7 @@ struct AppState {
 
 // Find the config with the maximum number of samples, so our triangle will be
 // smooth.
-pub fn gl_config_picker(configs: Box<dyn Iterator<Item = Config> + '_>) -> Config {
+fn gl_config_picker(configs: Box<dyn Iterator<Item = Config> + '_>) -> Config {
     configs
         .reduce(|accum, config| {
             let transparency_check = config.supports_transparency().unwrap_or(false)
@@ -376,7 +528,7 @@ pub fn gl_config_picker(configs: Box<dyn Iterator<Item = Config> + '_>) -> Confi
         .unwrap()
 }
 
-pub struct Renderer {
+struct Renderer {
     program: gl::types::GLuint,
     vao: gl::types::GLuint,
     vbo: gl::types::GLuint,
@@ -384,7 +536,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new<D: GlDisplay>(gl_display: &D) -> Self {
+    fn new<D: GlDisplay>(gl_display: &D) -> Self {
         unsafe {
             let gl = gl::Gl::load_with(|symbol| {
                 let symbol = CString::new(symbol).unwrap();
@@ -461,51 +613,43 @@ impl Renderer {
         }
     }
 
-    pub fn draw(&mut self, stroke: Stroke) {
-        let mut vertices = Vec::new();
-        for point in stroke.points {
-            vertices.push(point[0]);
-            vertices.push(point[1]);
-            vertices.push(stroke.color[0]);
-            vertices.push(stroke.color[1]);
-            vertices.push(stroke.color[2]);
+    fn draw(&mut self, strokes: &Vec<Stroke>, clear: bool) {
+        if clear {
+            unsafe {
+                self.gl.Clear(gl::COLOR_BUFFER_BIT);
+            }
         }
 
-        unsafe {
-            self.gl.BindBuffer(gl::ARRAY_BUFFER, self.vbo);
-            self.gl.BufferData(
-                gl::ARRAY_BUFFER,
-                (vertices.len() * std::mem::size_of::<f32>()) as gl::types::GLsizeiptr,
-                vertices.as_ptr() as *const _,
-                gl::DYNAMIC_DRAW,
-            );
-        }
+        for stroke in strokes.iter() {
+            let mut vertices = Vec::new();
+            for point in stroke.points.iter() {
+                vertices.push(point[0]);
+                vertices.push(point[1]);
+                vertices.push(stroke.color[0]);
+                vertices.push(stroke.color[1]);
+                vertices.push(stroke.color[2]);
+            }
 
-        self.draw_with_clear_color(0.1, 0.1, 0.1, 0.9, &vertices)
-    }
+            unsafe {
+                self.gl.BindBuffer(gl::ARRAY_BUFFER, self.vbo);
+                self.gl.BufferData(
+                    gl::ARRAY_BUFFER,
+                    (vertices.len() * std::mem::size_of::<f32>()) as gl::types::GLsizeiptr,
+                    vertices.as_ptr() as *const _,
+                    gl::DYNAMIC_DRAW,
+                );
+                self.gl.UseProgram(self.program);
+                self.gl.BindVertexArray(self.vao);
+                self.gl.BindBuffer(gl::ARRAY_BUFFER, self.vbo);
 
-    pub fn draw_with_clear_color(
-        &mut self,
-        red: GLfloat,
-        green: GLfloat,
-        blue: GLfloat,
-        alpha: GLfloat,
-        vertices: &Vec<f32>,
-    ) {
-        unsafe {
-            self.gl.UseProgram(self.program);
-            self.gl.BindVertexArray(self.vao);
-            self.gl.BindBuffer(gl::ARRAY_BUFFER, self.vbo);
-
-            self.gl.ClearColor(red, green, blue, alpha);
-            //self.gl.Clear(gl::COLOR_BUFFER_BIT);
-            self.gl.LineWidth(3.0);
-            self.gl
-                .DrawArrays(gl::LINE_STRIP, 0, (vertices.len() / 5) as i32);
+                self.gl.LineWidth(3.0);
+                self.gl
+                    .DrawArrays(gl::LINE_STRIP, 0, (vertices.len() / 5) as i32);
+            }
         }
     }
 
-    pub fn resize(&self, width: i32, height: i32) {
+    fn resize(&self, width: i32, height: i32) {
         unsafe {
             self.gl.Viewport(0, 0, width, height);
         }

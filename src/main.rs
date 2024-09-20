@@ -118,13 +118,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut app = App::new(template, display_builder);
     event_loop.run_app(&mut app)?;
 
-    /*let save_as = if flags.name.is_empty() {
+    let save_as = if flags.name.is_empty() {
         chrono::Local::now().timestamp_micros().to_string()
     } else {
         flags.name
-    };*/
-
-    let save_as = format!("scratch-{}", "test");
+    };
 
     let home_dir = match std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -893,8 +891,8 @@ impl Renderer {
     fn draw_to_pixels(&mut self, mut strokes: Vec<Stroke>) -> (i32, i32, Vec<u8>) {
         let (width, height) = self.get_viewport_size();
 
-        let mut top_left = [f32::MAX, f32::MAX];
-        let mut bottom_right = [f32::MIN, f32::MIN];
+        let mut top_left = [f32::MAX, f32::MIN];
+        let mut bottom_right = [f32::MIN, f32::MAX];
 
         // stroke points need mapped from ndc [-1, 1] to viewport coordinates
         // since not all strokes will be within the bounds of the viewport,
@@ -905,30 +903,39 @@ impl Renderer {
                 let [x, y] = point;
 
                 top_left[0] = top_left[0].min(*x);
-                top_left[1] = top_left[1].min(*y);
+                top_left[1] = top_left[1].max(*y);
             }
         }
 
         for stroke in strokes.iter_mut() {
             for point in stroke.points.iter_mut() {
-                point[0] -= top_left[0] + 1.0;
-                point[1] -= top_left[1] + 1.0;
+                point[0] -= top_left[0];
+                point[1] -= top_left[1];
 
                 bottom_right[0] = bottom_right[0].max(point[0]);
-                bottom_right[1] = bottom_right[1].max(point[1]);
+                bottom_right[1] = bottom_right[1].min(point[1]);
             }
         }
 
         top_left = [0.0, 0.0];
 
-        let ndc_width = std::cmp::max((bottom_right[0] - top_left[0]).ceil() as usize, 1);
-        let ndc_height = std::cmp::max((bottom_right[1] - top_left[1]).ceil() as usize, 1);
-
-        let mut tiles: Vec<Vec<Vec<u8>>> = Vec::new();
+        let ndc_width = std::cmp::max(((bottom_right[0] - top_left[0]) / 2.0).ceil() as usize, 1);
+        let ndc_height = std::cmp::max(((top_left[1] - bottom_right[1]) / 2.0).ceil() as usize, 1);
 
         let mut fbo = 0;
         let mut texture = 0;
 
+        let final_width = width as usize * ndc_width;
+        let final_height = height as usize * ndc_height;
+        let final_size = final_width * final_height * 3;
+
+        println!(
+            "creating image with dims ({}, {})",
+            final_width, final_height
+        );
+
+        let mut indices = std::collections::HashMap::new();
+        let mut final_image = vec![0u8; final_size];
         unsafe {
             self.gl.GenFramebuffers(1, &mut fbo);
             self.gl.BindFramebuffer(gl::FRAMEBUFFER, fbo);
@@ -964,15 +971,14 @@ impl Renderer {
             }
 
             for y in 0..ndc_height {
-                tiles.push(Vec::new());
                 for x in 0..ndc_width {
                     let offset_strokes = strokes
                         .iter()
                         .map(|s| {
                             let mut points = s.points.clone();
                             for point in points.iter_mut() {
-                                point[0] -= x as f32;
-                                point[1] -= y as f32;
+                                point[0] -= (x * 2) as f32;
+                                point[1] += (y * 2) as f32;
                             }
 
                             Stroke {
@@ -1012,14 +1018,26 @@ impl Renderer {
                             .copy_from_slice(&temp_row);
                     }
 
-                    let mut white = 0;
-                    for i in pixels.iter() {
-                        if *i == 255 {
-                            white += 1;
+                    let height = height as usize;
+                    let width = width as usize;
+                    for r in 0..height {
+                        for c in 0..width {
+                            let i = ((y * height + r) * final_width) * 3;
+                            let j = (x * width + c) * 3;
+
+                            let final_index = i + j;
+                            let tile_index = (r * width + c) * 3;
+
+                            for k in 0..3 {
+                                final_image[final_index + k] = pixels[tile_index + k];
+
+                                let count = indices.entry(tile_index + k).or_insert(0);
+                                *count += 1;
+                            }
                         }
                     }
 
-                    tiles[y].push(pixels);
+                    println!("FINISH TILE ({}, {})", x, y);
                 }
             }
 
@@ -1027,37 +1045,9 @@ impl Renderer {
             println!("framebuffer unbound");
         }
 
-        let ndc_height = ndc_height as usize;
-        let ndc_width = ndc_width as usize;
-        let height = height as usize;
-        let width = width as usize;
-
-        let final_width = width * ndc_width;
-        let final_height = height * ndc_height;
-        let final_size = final_width * final_height * 3;
-
-        let mut final_image = vec![0u8; final_size];
-        for y in 0..ndc_height {
-            for x in 0..ndc_width {
-                for r in 0..height {
-                    for c in 0..width {
-                        let tile_width = tiles[y][x].len() / height;
-
-                        let i = y * height + r;
-                        let j = x * tile_width + c;
-                        let final_index = i * final_width * 3 + j;
-
-                        for k in 0..3 {
-                            final_image[final_index + k] = tiles[y][x][r * tile_width + c * 3 + k];
-                        }
-                    }
-                }
-            }
-        }
-
         (
-            (width * ndc_width) as i32,
-            (height * ndc_height) as i32,
+            (width as usize * ndc_width) as i32,
+            (height as usize * ndc_height) as i32,
             final_image,
         )
     }

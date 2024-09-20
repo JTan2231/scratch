@@ -3,7 +3,8 @@ use std::ffi::{CStr, CString};
 use std::num::NonZeroU32;
 use std::ops::Deref;
 
-use gl::types::GLfloat;
+use image::{ImageBuffer, Rgb};
+
 use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -27,21 +28,87 @@ pub mod gl {
     pub use Gles2 as Gl;
 }
 
+enum ExportType {
+    None,
+    JPG,
+    PNG,
+}
+
+struct Flags {
+    pub export_type: ExportType,
+    pub name: String,
+}
+
+fn man() {}
+
+fn parse_flags() -> Result<Flags, std::io::Error> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut flags = Flags {
+        export_type: ExportType::JPG,
+        name: "".to_string(),
+    };
+
+    if args.len() < 1 {
+        panic!("Usage: {} [-sef]", args[0]);
+    }
+
+    for arg in args.iter().skip(1) {
+        if arg.starts_with("-") && !arg.starts_with("--") {
+            for (i, c) in arg.chars().enumerate().skip(1) {
+                match c {
+                    'e' => {
+                        if i + 1 < args.len() {
+                            flags.export_type = match args[i + 1].as_str() {
+                                "jpg" => ExportType::JPG,
+                                "png" => ExportType::PNG,
+                                "none" => ExportType::None,
+                                _ => {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidInput,
+                                        "Invalid argument for flag -e",
+                                    ));
+                                }
+                            };
+                        } else {
+                            man();
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "Missing argument for flag -e",
+                            ));
+                        }
+                    }
+                    'n' => {
+                        if i + 1 < args.len() {
+                            flags.name = args[i + 1].clone();
+                        } else {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "Missing argument for flag -n",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("Invalid flag: {}", c),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(flags)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    let flags = parse_flags()?;
     let event_loop = winit::event_loop::EventLoop::new().unwrap();
 
     let window_attributes = Window::default_attributes()
         .with_transparent(true)
-        .with_title("Glutin triangle gradient example (press Escape to exit)");
+        .with_title("Scratch");
 
-    // The template will match only the configurations supporting rendering
-    // to windows.
-    //
-    // XXX We force transparency only on macOS, given that EGL on X11 doesn't
-    // have it, but we still want to show window. The macOS situation is like
-    // that, because we can query only one config at a time on it, but all
-    // normal platforms will return multiple configs, so we can find the config
-    // with transparency ourselves inside the `reduce`.
     let template = ConfigTemplateBuilder::new()
         .with_alpha_size(8)
         .with_transparency(cfg!(cgl_backend));
@@ -51,6 +118,43 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut app = App::new(template, display_builder);
     event_loop.run_app(&mut app)?;
 
+    /*let save_as = if flags.name.is_empty() {
+        chrono::Local::now().timestamp_micros().to_string()
+    } else {
+        flags.name
+    };*/
+
+    let save_as = format!("scratch-{}", "test");
+
+    let home_dir = match std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .or_else(|_| {
+            std::env::var("HOMEDRIVE").and_then(|homedrive| {
+                std::env::var("HOMEPATH").map(|homepath| format!("{}{}", homedrive, homepath))
+            })
+        }) {
+        Ok(dir) => std::path::PathBuf::from(dir),
+        Err(_) => panic!("Failed to get home directory"),
+    };
+
+    let save_dir = home_dir.join(".local/scratch/notes/");
+    std::fs::create_dir_all(&save_dir)?;
+
+    let format = match flags.export_type {
+        ExportType::JPG => "jpg",
+        ExportType::PNG => "png",
+        ExportType::None => "none",
+    };
+
+    let save_path = save_dir.join(format!("{}.{}", save_as, format));
+
+    let (width, height, pixels) = app.final_pixels.unwrap();
+    let image = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(width as u32, height as u32, pixels)
+        .expect("Failed to create image buffer");
+
+    image.save(save_path.clone())?;
+    println!("Saved to {}", save_path.display());
+
     app.exit_state
 }
 
@@ -59,6 +163,10 @@ fn window_coords_to_ndc(x: f64, y: f64, width: u32, height: u32) -> [f32; 2] {
     let y = 1.0 - (2.0 * y as f32 / height as f32);
 
     [x, y]
+}
+
+fn ndc_origin() -> [f32; 2] {
+    [-1.0, 1.0]
 }
 
 fn distance(p1: [f32; 2], p2: [f32; 2]) -> f32 {
@@ -72,6 +180,7 @@ fn get_default_cursor(input_mode: InputMode) -> winit::window::CursorIcon {
         InputMode::Draw => winit::window::CursorIcon::Crosshair,
         InputMode::Select => winit::window::CursorIcon::Default,
         InputMode::Erase => winit::window::CursorIcon::Cell,
+        InputMode::Pan => winit::window::CursorIcon::Grab,
     }
 }
 
@@ -183,6 +292,10 @@ impl ApplicationHandler for App {
                 input_mode: InputMode::Draw,
                 clear_on_next_draw: false,
                 mouse_down: false,
+                pan_state: PanState {
+                    current_pan_start: None,
+                    current_pan_position: None,
+                },
             })
             .is_none());
     }
@@ -224,15 +337,25 @@ impl ApplicationHandler for App {
                     renderer.resize(size.width as i32, size.height as i32);
                 }
             }
-            WindowEvent::CloseRequested
-            | WindowEvent::KeyboardInput {
+            WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
                         logical_key: Key::Named(NamedKey::Escape),
                         ..
                     },
                 ..
-            } => event_loop.exit(),
+            } => {
+                if self.final_pixels.is_none() {
+                    self.final_pixels = Some(
+                        self.renderer
+                            .as_mut()
+                            .unwrap()
+                            .draw_to_pixels(self.state.as_ref().unwrap().strokes.clone()),
+                    );
+                }
+
+                event_loop.exit()
+            }
             // i'm positive there's a better way for this but i'm not familiar enough with rust
             // syntax
             WindowEvent::KeyboardInput {
@@ -283,6 +406,22 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyH),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(AppState { window, .. }) = self.state.as_ref() {
+                    window.set_cursor(get_default_cursor(InputMode::Pan));
+                    if let Some(AppState { input_mode, .. }) = self.state.as_mut() {
+                        *input_mode = InputMode::Pan;
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let Some(AppState {
                     gl_context,
@@ -291,6 +430,7 @@ impl ApplicationHandler for App {
                     current_stroke,
                     strokes,
                     clear_on_next_draw,
+                    pan_state,
                     ..
                 }) = self.state.as_mut()
                 {
@@ -311,8 +451,44 @@ impl ApplicationHandler for App {
                         return;
                     }
 
+                    let (width, height): (u32, u32) = window.inner_size().into();
+                    let origin = ndc_origin();
+                    let strokes_to_render = strokes_to_render
+                        .into_iter()
+                        .map(|s| {
+                            let mut points = s.points.clone();
+                            for point in points.iter_mut() {
+                                if let Some(current_pan_start) = pan_state.current_pan_start {
+                                    if let Some(current_pan_position) =
+                                        pan_state.current_pan_position
+                                    {
+                                        let dxdy = window_coords_to_ndc(
+                                            current_pan_position.0 - current_pan_start.0,
+                                            current_pan_position.1 - current_pan_start.1,
+                                            width,
+                                            height,
+                                        );
+
+                                        let (dx, dy) = (
+                                            dxdy[0] as f32 - origin[0],
+                                            dxdy[1] as f32 - origin[1],
+                                        );
+
+                                        point[0] += dx as f32;
+                                        point[1] += dy as f32;
+                                    }
+                                }
+                            }
+
+                            Stroke {
+                                points,
+                                color: s.color,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+
                     let renderer = self.renderer.as_mut().unwrap();
-                    renderer.draw(strokes_to_render, *clear_on_next_draw);
+                    renderer.draw(&strokes_to_render, *clear_on_next_draw);
                     window.request_redraw();
 
                     gl_surface.swap_buffers(gl_context).unwrap();
@@ -329,6 +505,7 @@ impl ApplicationHandler for App {
                     input_mode,
                     clear_on_next_draw,
                     mouse_down,
+                    pan_state,
                     ..
                 }) = self.state.as_mut()
                 {
@@ -373,6 +550,12 @@ impl ApplicationHandler for App {
                         if *clear_on_next_draw {
                             strokes.remove(index_to_remove);
                         }
+                    } else if input_mode == &InputMode::Pan && *mouse_down {
+                        if pan_state.current_pan_start.is_some() {
+                            pan_state.current_pan_position = Some(*cursor_position);
+                        }
+
+                        *clear_on_next_draw = true;
                     }
 
                     window.set_cursor(get_default_cursor(input_mode.clone()));
@@ -393,6 +576,7 @@ impl ApplicationHandler for App {
                     strokes,
                     clear_on_next_draw,
                     mouse_down,
+                    pan_state,
                     ..
                 }) = self.state.as_mut()
                 {
@@ -425,6 +609,9 @@ impl ApplicationHandler for App {
                         if *clear_on_next_draw {
                             strokes.remove(index_to_remove);
                         }
+                    } else if input_mode == &InputMode::Pan && pan_state.current_pan_start.is_none()
+                    {
+                        pan_state.current_pan_start = Some(*cursor_position);
                     }
 
                     *mouse_down = true;
@@ -443,12 +630,40 @@ impl ApplicationHandler for App {
                     strokes,
                     mouse_down,
                     window,
+                    pan_state,
                     ..
                 }) = self.state.as_mut()
                 {
                     if let Some(stroke) = current_stroke {
                         strokes.push(stroke.clone());
                         *current_stroke = None;
+                    }
+
+                    if let Some(current_pan_position) = pan_state.current_pan_position {
+                        let (width, height): (u32, u32) = window.inner_size().into();
+                        let origin = ndc_origin();
+
+                        let dxdy = window_coords_to_ndc(
+                            current_pan_position.0 - pan_state.current_pan_start.unwrap().0,
+                            current_pan_position.1 - pan_state.current_pan_start.unwrap().1,
+                            width,
+                            height,
+                        );
+
+                        let dxdy = [
+                            dxdy[0] as f64 - origin[0] as f64,
+                            dxdy[1] as f64 - origin[1] as f64,
+                        ];
+
+                        for stroke in strokes.iter_mut() {
+                            for point in stroke.points.iter_mut() {
+                                point[0] += dxdy[0] as f32;
+                                point[1] += dxdy[1] as f32;
+                            }
+                        }
+
+                        pan_state.current_pan_start = None;
+                        pan_state.current_pan_position = None;
                     }
 
                     window.request_redraw();
@@ -469,6 +684,7 @@ struct App {
     renderer: Option<Renderer>,
     // NOTE: `AppState` carries the `Window`, thus it should be dropped after everything else.
     state: Option<AppState>,
+    final_pixels: Option<(i32, i32, Vec<u8>)>,
 }
 
 impl App {
@@ -480,6 +696,7 @@ impl App {
             not_current_gl_context: None,
             state: None,
             renderer: None,
+            final_pixels: None,
         }
     }
 }
@@ -495,12 +712,19 @@ enum InputMode {
     Draw,
     Select,
     Erase,
+    Pan,
+}
+
+struct PanState {
+    current_pan_start: Option<(f64, f64)>,
+    current_pan_position: Option<(f64, f64)>,
 }
 
 struct AppState {
     gl_context: PossiblyCurrentContext,
     gl_surface: Surface<WindowSurface>,
     cursor_position: (f64, f64),
+    pan_state: PanState,
     strokes: Vec<Stroke>,
     current_stroke: Option<Stroke>,
     input_mode: InputMode,
@@ -613,6 +837,7 @@ impl Renderer {
         }
     }
 
+    // NOTE: only draws to whatever framebuffer is currently bound
     fn draw(&mut self, strokes: &Vec<Stroke>, clear: bool) {
         if clear {
             unsafe {
@@ -653,6 +878,188 @@ impl Renderer {
         unsafe {
             self.gl.Viewport(0, 0, width, height);
         }
+    }
+
+    fn get_viewport_size(&self) -> (i32, i32) {
+        let mut viewport = [0; 4];
+        unsafe {
+            self.gl.GetIntegerv(gl::VIEWPORT, viewport.as_mut_ptr());
+        }
+
+        (viewport[2], viewport[3])
+    }
+
+    // NOTE: this function is assumed to _only_ be called on program exit
+    fn draw_to_pixels(&mut self, mut strokes: Vec<Stroke>) -> (i32, i32, Vec<u8>) {
+        let (width, height) = self.get_viewport_size();
+
+        let mut top_left = [f32::MAX, f32::MAX];
+        let mut bottom_right = [f32::MIN, f32::MIN];
+
+        // stroke points need mapped from ndc [-1, 1] to viewport coordinates
+        // since not all strokes will be within the bounds of the viewport,
+        // the resulting framebuffer height/width will need to be adjusted
+        // to include all strokes
+        for stroke in strokes.iter() {
+            for point in stroke.points.iter() {
+                let [x, y] = point;
+
+                top_left[0] = top_left[0].min(*x);
+                top_left[1] = top_left[1].min(*y);
+            }
+        }
+
+        for stroke in strokes.iter_mut() {
+            for point in stroke.points.iter_mut() {
+                point[0] -= top_left[0] + 1.0;
+                point[1] -= top_left[1] + 1.0;
+
+                bottom_right[0] = bottom_right[0].max(point[0]);
+                bottom_right[1] = bottom_right[1].max(point[1]);
+            }
+        }
+
+        top_left = [0.0, 0.0];
+
+        let ndc_width = std::cmp::max((bottom_right[0] - top_left[0]).ceil() as usize, 1);
+        let ndc_height = std::cmp::max((bottom_right[1] - top_left[1]).ceil() as usize, 1);
+
+        let mut tiles: Vec<Vec<Vec<u8>>> = Vec::new();
+
+        let mut fbo = 0;
+        let mut texture = 0;
+
+        unsafe {
+            self.gl.GenFramebuffers(1, &mut fbo);
+            self.gl.BindFramebuffer(gl::FRAMEBUFFER, fbo);
+
+            self.gl.GenTextures(1, &mut texture);
+            self.gl.BindTexture(gl::TEXTURE_2D, texture);
+            self.gl.TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGB as i32,
+                width,
+                height,
+                0,
+                gl::RGB,
+                gl::UNSIGNED_BYTE,
+                std::ptr::null(),
+            );
+            self.gl
+                .TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+            self.gl
+                .TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+
+            self.gl.FramebufferTexture2D(
+                gl::FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                gl::TEXTURE_2D,
+                texture,
+                0,
+            );
+
+            if self.gl.CheckFramebufferStatus(gl::FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
+                panic!("Framebuffer is not complete!");
+            }
+
+            for y in 0..ndc_height {
+                tiles.push(Vec::new());
+                for x in 0..ndc_width {
+                    let offset_strokes = strokes
+                        .iter()
+                        .map(|s| {
+                            let mut points = s.points.clone();
+                            for point in points.iter_mut() {
+                                point[0] -= x as f32;
+                                point[1] -= y as f32;
+                            }
+
+                            Stroke {
+                                points,
+                                color: s.color,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    self.draw(&offset_strokes, true);
+                    self.gl.Flush();
+
+                    let mut pixels = vec![0u8; (width * height * 3) as usize];
+                    self.gl.ReadPixels(
+                        0,
+                        0,
+                        width,
+                        height,
+                        gl::RGB,
+                        gl::UNSIGNED_BYTE,
+                        pixels.as_mut_ptr() as *mut _,
+                    );
+
+                    let row_size = (width * 3) as usize;
+                    let mut temp_row = vec![0u8; row_size];
+                    for y in 0..height as usize / 2 {
+                        let top_row_start = y * row_size;
+                        let bottom_row_start = (height as usize - 1 - y) * row_size;
+
+                        temp_row.copy_from_slice(&pixels[top_row_start..top_row_start + row_size]);
+
+                        pixels.copy_within(
+                            bottom_row_start..bottom_row_start + row_size,
+                            top_row_start,
+                        );
+
+                        pixels[bottom_row_start..bottom_row_start + row_size]
+                            .copy_from_slice(&temp_row);
+                    }
+
+                    let mut white = 0;
+                    for i in pixels.iter() {
+                        if *i == 255 {
+                            white += 1;
+                        }
+                    }
+
+                    tiles[y].push(pixels);
+                }
+            }
+
+            self.gl.BindFramebuffer(gl::FRAMEBUFFER, 0);
+            println!("framebuffer unbound");
+        }
+
+        let ndc_height = ndc_height as usize;
+        let ndc_width = ndc_width as usize;
+        let height = height as usize;
+        let width = width as usize;
+
+        let final_width = width * ndc_width;
+        let final_height = height * ndc_height;
+        let final_size = final_width * final_height * 3;
+
+        let mut final_image = vec![0u8; final_size];
+        for y in 0..ndc_height {
+            for x in 0..ndc_width {
+                for r in 0..height {
+                    for c in 0..width {
+                        let tile_width = tiles[y][x].len() / height;
+
+                        let i = y * height + r;
+                        let j = x * tile_width + c;
+                        let final_index = i * final_width * 3 + j;
+
+                        for k in 0..3 {
+                            final_image[final_index + k] = tiles[y][x][r * tile_width + c * 3 + k];
+                        }
+                    }
+                }
+            }
+        }
+
+        (
+            (width * ndc_width) as i32,
+            (height * ndc_height) as i32,
+            final_image,
+        )
     }
 }
 

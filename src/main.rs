@@ -934,7 +934,6 @@ impl Renderer {
             final_width, final_height
         );
 
-        let mut indices = std::collections::HashMap::new();
         let mut final_image = vec![0u8; final_size];
         unsafe {
             self.gl.GenFramebuffers(1, &mut fbo);
@@ -1030,14 +1029,9 @@ impl Renderer {
 
                             for k in 0..3 {
                                 final_image[final_index + k] = pixels[tile_index + k];
-
-                                let count = indices.entry(tile_index + k).or_insert(0);
-                                *count += 1;
                             }
                         }
                     }
-
-                    println!("FINISH TILE ({}, {})", x, y);
                 }
             }
 

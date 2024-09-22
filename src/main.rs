@@ -909,8 +909,8 @@ impl Renderer {
 
         for stroke in strokes.iter_mut() {
             for point in stroke.points.iter_mut() {
-                point[0] -= top_left[0];
-                point[1] -= top_left[1];
+                point[0] -= 1.0 + top_left[0];
+                point[1] -= top_left[1] - 1.0;
 
                 bottom_right[0] = bottom_right[0].max(point[0]);
                 bottom_right[1] = bottom_right[1].min(point[1]);
